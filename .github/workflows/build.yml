@@ -4,82 +4,86 @@ on:
     tags:
       - v*
     branches:
-       - test-release/*
+      - test-release/*
+
+permissions:
+  contents: read
 
 jobs:
-  get-version:
-    runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-    steps:
-      - id: version
-        run: echo "version=${ref##test-release/}" >> $GITHUB_OUTPUT
-        env:
-          ref: ${{ github.ref_name }}
-
   build-releases:
-    name: Build release
+    name: Build ${{ matrix.platform.arch }} release
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         platform:
-        - docker: amd64
-          arch: x86_64
-        - docker: arm64/v8
-          arch: aarch64
-        - docker: arm/v7
-          arch: armv7h
+          - docker: amd64
+            arch: x86_64
+          - docker: arm64/v8
+            arch: aarch64
+          - docker: arm/v7
+            arch: armv7h
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: docker/setup-qemu-action@v3
         with:
           platforms: all
       - uses: docker/setup-buildx-action@v3
         with:
           version: latest
-          install: true
-      - run: docker build --platform=linux/${{ matrix.platform.docker }} -o . .
-      - uses: actions/upload-artifact@v3
+      - run: docker buildx build --platform=linux/${{ matrix.platform.docker }} -o . .
+      - uses: actions/upload-artifact@v7
         with:
           name: paru-${{ matrix.platform.arch }}
           path: paru.tar.zst
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
 
   release:
-    name: Create GitHub Release
+    name: Create draft release
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
-    needs: [build-releases, get-version]
-    outputs:
-      release-url: ${{ steps.create-release.outputs.upload_url }}
+    needs: build-releases
+    permissions:
+      contents: write
+    concurrency: release-${{ github.ref }}
     steps:
-    - name: Create Release
-      id: create-release
-      uses: actions/create-release@master
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ needs.get-version.outputs.version }}
-        release_name: Paru v${{ needs.get-version.outputs.version }}
-        draft: true
-        prerelease: false
-
-  upload-binaries:
-    name: Upload binaries to Githib relase
-    runs-on: ubuntu-latest
-    needs: [release, get-version]
-    strategy:
-      matrix:
-          arch: [x86_64, aarch64, armv7h]
-    steps:
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v8
         with:
-          name: paru-${{ matrix.arch }}
-      - uses: actions/upload-release-asset@v1
+          pattern: paru-*
+          path: artifacts
+      - name: Upload release assets
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.release.outputs.release-url }}
-          asset_name: paru-${{ needs.get-version.outputs.version }}-${{ matrix.arch }}.tar.zst
-          asset_path: paru.tar.zst
-          asset_content_type: application/tar+zstd
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          for arch in x86_64 aarch64 armv7h; do
+            mv "artifacts/paru-$arch/paru.tar.zst" "paru-$RELEASE_TAG-$arch.tar.zst"
+          done
+
+          if gh release view "$RELEASE_TAG" --json isDraft,assets > release.json; then
+            if ! jq -e '.isDraft' release.json > /dev/null; then
+              echo "Release $RELEASE_TAG is already published" >&2
+              exit 1
+            fi
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft --title "Paru $RELEASE_TAG" --notes ''
+            printf '{"assets":[]}\n' > release.json
+          fi
+
+          for asset in paru-*.tar.zst; do
+            if jq -e --arg name "$asset" '.assets[] | select(.name == $name)' release.json > /dev/null; then
+              if ! jq -e --arg name "$asset" '.assets[] | select(.name == $name) | .state == "uploaded" and .size > 0' release.json > /dev/null; then
+                echo "Release asset $asset is incomplete; delete it before rerunning" >&2
+                exit 1
+              fi
+            else
+              gh release upload "$RELEASE_TAG" "$asset"
+            fi
+          done
 
